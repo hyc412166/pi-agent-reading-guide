@@ -485,7 +485,76 @@ SQLite 实现把表记录、document revision 和 commit 序号放在关系存�
 
 只看 TUI 的最终错误文字无法区分四层。读取 `submission.status`、`pi.live`、tool-result diagnostics 和 transport 错误位置，才知道失败发生在哪个边界。[view.ts](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/harness/view.ts) · [errors.ts](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/env/src/errors.ts)
 
-## 13.24 建议沿四个具体问题读源码
+## 13.24 子 agent：普通扩展示例与实验性实现
+
+### 三条路径都有什么，普通 Pi 默认启动哪一条
+
+| 路径 | 子 agent 如何运行 | 是否有真实执行逻辑 | 入口与边界 |
+|---|---|---|---|
+| 普通 Pi 的 subagent 扩展示例 | 为任务启动独立 Pi 子进程 | 有：真实模型请求、工具执行、结果收集 | 需另外加载扩展和 agent 配置；详见第 10 章第 22 节 |
+| `experimental/durable` | 同一 Harness 中创建由工具任务拥有的子 conversation | 有：接入模型运行时、存储和任务调度 | 单独的实验程序，普通 `pi` 不会默认进入这里 |
+| `experimental/vacation` | 后台 task 拥有子 conversation，完成后投递报告 | 协作机制真实；search 返回预设数据 | 展示后台执行与恢复，不是联网旅行搜索产品 |
+
+“实验性”表示它是单独的实验入口、接口和功能覆盖需要按该入口评估，不表示文件里只有伪代码。`experimental/durable/runtime.ts` 实际创建 `ModelRuntime`，注册 `Subagent`，通过 SQLite 存储打开 Harness。它复用普通 Pi 的部分配置与界面组件，但不是给普通 agent loop 自动增加一套默认多 agent 系统。[Durable runtime](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/coding-agent/src/experimental/durable/runtime.ts) · [普通扩展调用链](10-提示词与扩展机制.md)
+
+### 前台子 agent：一次工具调用如何拥有一个会话
+
+沿 [durable/subagent.ts](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/coding-agent/src/experimental/durable/subagent.ts) 阅读，工具参数只有 `task`。它的 `execute(args, api, context)` 做了以下事情：
+
+1. 在提交事务中按当前 `api.taskId` 查找已拥有的子 conversation。存在则复用，这使崩溃后重跑能够找到同一个子会话。
+2. 不存在时调用 `tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } })`。子会话从父会话的 agent 配置开始，但不继承父聊天历史；任务应包含必要背景。
+3. 从子会话配置移除 `Subagent` 扩展，避免它继续递归委派。继承配置不代表照搬父会话所有能力而不作调整。
+4. 用 `api.details({ conversationId: child })` 记录会话标识，再取得子 conversation 的可操作 handle。
+5. 提交 `{ type: "input", content: args.task, requestId: "subagent:" + api.taskId }`，随后 `await ...wait(context)` 等待结算。稳定的 requestId 用于重跑时识别同一次提交。
+6. 只有 `settled.status === "done"` 且 `settled.type === "input"` 才继续读取答案；否则抛出带状态的错误。
+7. `answerText()` 根据答案 entry ID 读取 `AssistantEntry`，提取文本内容，作为父工具结果返回，并附上子 conversation ID。
+
+```mermaid
+flowchart TD
+    A[主模型调用 subagent 工具] --> B{当前工具任务已有子会话吗}
+    B -->|有| C[复用子会话]
+    B -->|没有| D[创建由工具任务拥有的子会话]
+    D --> E[移除子会话的 Subagent 扩展]
+    E --> C
+    C --> F[用稳定 requestId 提交 task]
+    F --> G[子会话运行自己的模型和工具流程]
+    G --> H[父工具等待 submission 结算]
+    H --> I{是否成功完成输入请求}
+    I -->|是| J[读取答案文本并返回工具结果]
+    I -->|否| K[抛出执行失败错误]
+```
+
+这里的“前台”指工具要等待子任务答案后才完成，不是终端界面完全不能操作。实验 TUI 的 `/agents` 可以切到子会话查看或引导它，工具调用返回后也可继续与该子会话交谈。取消调用会取消其子工作；主会话取消向下传播依赖第 13.14 节的 ownership 关系。不要把创建独立子 conversation 与 `fork()` 继承聊天历史混为一谈。[实验使用说明](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/coding-agent/src/experimental/durable/README.md)
+
+### 后台子 agent：为什么主会话能够先继续
+
+`vacation` 的 `research` 工具采用不同安排：在事务中派生后台 `Research` task，并为它创建子 conversation；工具随即返回“研究已在后台开始”。之后由后台任务提交研究请求并等待完成，再把报告作为主会话的新输入提交，`whenBusy: "followUp"` 让忙碌时按后续输入处理。
+
+```text
+主模型调用 research
+  → 创建后台任务与它拥有的子会话
+  → research 工具先返回，主会话可以继续
+
+后台 Research task
+  → 向子会话提交研究任务
+  → 等待子会话完成
+  → 保存待投递报告的阶段状态
+  → 将报告作为新输入投递给主会话
+```
+
+任务的 `deliver` / `report` 阶段和稳定 requestId 支持恢复时继续投递流程，避免把“进程重新启动”简单理解为“重新创建一套子 agent”。但示例中的搜索结果来自文件顶部预设的天气、博物馆和列车数据，`sleep` 用于拉开执行时间，便于观察中断与恢复；不能把这个 search 当成真实网页搜索。子会话调度、模型运行与报告回传机制和搜索数据来源应分别判断。[vacation.ts](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/coding-agent/src/experimental/vacation/vacation.ts) · [vacation README](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/coding-agent/src/experimental/vacation/README.md)
+
+### 使用时需要选对启动入口
+
+若目标是在普通 Pi 中委派代码调查，按第 10 章加载 subagent 扩展即可，不必迁移到 Durable。若目标是学习持久任务、子会话导航和恢复，则从源码仓库按 Durable README 准备依赖与运行环境，再使用其单独入口，例如：
+
+```powershell
+node --import ./packages/coding-agent/src/experimental/source-resolver.ts packages/coding-agent/src/experimental/durable/main.ts
+```
+
+这个命令来自实验入口的说明，不是“任何只克隆了源码的机器都能直接运行”的承诺。模型认证与配置也须可用；实验入口复用普通 Pi 的认证。普通扩展的多进程调度、Durable 的多会话调度，以及多 agent 是否能同时改同一个文件，是三个不同问题，不能用“支持子 agent”一概替代这些边界。
+
+## 13.25 建议沿四个具体问题读源码
 
 1. **为什么用户提交后不会只存消息、不存运行任务？** 从 [admitSubmission](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/harness/submissions.ts) 走到 [startRun](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/harness/generation.ts)、[Transaction](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/session/transaction.ts)、[Session commit](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/session/session.ts)。
 2. **工具执行到一半断电会怎样？** 读 [ToolTask call/execute](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/harness/tool.ts)、[scheduler open](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/src/harness/scheduler.ts)，再对照 [工具恢复测试](https://github.com/earendil-works/pi/blob/6fb2e7815167e6b19006fc526d1a5d0f5f998787/packages/durable/test/harness-tools-recovery.test.ts)。特别区分 `safe` 重放与 `interrupted` 结果。
